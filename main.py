@@ -1,5 +1,6 @@
 import os
 import sys
+from datetime import datetime, timedelta
 
 import rich.align
 from dotenv import load_dotenv
@@ -24,6 +25,11 @@ VALUE_GRADIENT_STOPS = [
     (0.5, "#ffff00"),  # Yellow at 50% of max
     (1.0, "#ff0000"),  # Red at max
 ]
+
+# Inline sparkline settings (kept tiny to fit a ~60x15 char UI)
+SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
+SPARK_WIDTH = 7  # number of buckets / chars
+SPARK_RANGE = timedelta(hours=24)
 
 # Initialize Rich console
 console = Console()
@@ -80,6 +86,36 @@ def get_gradient_color(position: float, stops: list[tuple[float, str]]) -> str |
             return f"#{r:02x}{g:02x}{b:02x}"
 
 
+def render_sparkline(values: list[float], width: int = SPARK_WIDTH) -> str:
+    """Renders a tiny Unicode block sparkline from a series of values.
+
+    Scales relative to the series' own min/max. Each block is color-graded by
+    its height so spikes stand out. Returns a fixed-width, dim-padded string.
+    """
+    if not values:
+        return f"[bright_black]{'·' * width}[/bright_black]"
+
+    # Keep the most recent `width` points
+    series = values[-width:]
+
+    lo = min(series)
+    hi = max(series)
+    span = hi - lo
+
+    chars = []
+    for v in series:
+        # Position within the series' own range -> block + gradient color
+        norm = (v - lo) / span if span > 0 else 0.0
+        idx = int(round(norm * (len(SPARK_BLOCKS) - 1)))
+        color = get_gradient_color(norm, VALUE_GRADIENT_STOPS)
+        chars.append(f"[{color}]{SPARK_BLOCKS[idx]}[/{color}]")
+
+    # Left-pad with dim dots so all sparklines align to a fixed width
+    pad = width - len(series)
+    prefix = f"[bright_black]{'·' * pad}[/bright_black]" if pad > 0 else ""
+    return prefix + "".join(chars)
+
+
 def get_prom_client():
     auth: HTTPBasicAuth | None = None
 
@@ -105,9 +141,38 @@ def fetch_fail2ban_metrics():
 
         bans_1h_query = 'increase({__name__=~"f2b_jail_banned_total|fail2ban_jail_banned_total"}[1h])'
         fails_1h_query = 'increase({__name__=~"f2b_jail_failed_total|fail2ban_jail_failed_total"}[1h])'
+        bans_1d_query = 'increase({__name__=~"f2b_jail_banned_total|fail2ban_jail_banned_total"}[1d])'
+        fails_1d_query = 'increase({__name__=~"f2b_jail_failed_total|fail2ban_jail_failed_total"}[1d])'
 
         bans_1h_data = prom.custom_query(query=bans_1h_query)
         fails_1h_data = prom.custom_query(query=fails_1h_query)
+        bans_1d_data = prom.custom_query(query=bans_1d_query)
+        fails_1d_data = prom.custom_query(query=fails_1d_query)
+
+        # Range data for inline sparklines (trend over SPARK_RANGE)
+        end_time = datetime.now()
+        start_time = end_time - SPARK_RANGE
+        step = f"{int(SPARK_RANGE.total_seconds() // SPARK_WIDTH)}s"
+
+        bans_series_query = (
+            '{__name__=~"f2b_jail_banned_current|fail2ban_jail_banned_current"}'
+        )
+        fails_series_query = (
+            'rate({__name__=~"f2b_jail_failed_total|fail2ban_jail_failed_total"}[5m])'
+        )
+
+        bans_series_data = prom.custom_query_range(
+            query=bans_series_query,
+            start_time=start_time,
+            end_time=end_time,
+            step=step,
+        )
+        fails_series_data = prom.custom_query_range(
+            query=fails_series_query,
+            start_time=start_time,
+            end_time=end_time,
+            step=step,
+        )
 
     except PrometheusApiClientException as e:
         console.print(f"[bold red]ERROR:[/bold red] Prometheus API exception: {e}")
@@ -121,10 +186,9 @@ def fetch_fail2ban_metrics():
     jails_data = {}
     instances = set()
 
-    # Process Base Data (Current & Totals)
+    # Process Base Data (discover jails + instances)
     for result in base_data:
         metric = result.get("metric", {})
-        metric_name = metric.get("__name__", "")
         jail_name = metric.get("jail")
         instance_name = metric.get("instance", "unknown")
 
@@ -132,34 +196,22 @@ def fetch_fail2ban_metrics():
             continue
 
         instances.add(instance_name)
-        value = int(result.get("value", [0, "0"])[1])
 
         if jail_name not in jails_data:
             jails_data[jail_name] = {}
 
         if instance_name not in jails_data[jail_name]:
             jails_data[jail_name][instance_name] = {
-                "banned_current": 0,
-                "banned_total": 0,
                 "banned_1h": 0,
-                "failed_current": 0,
-                "failed_total": 0,
+                "banned_1d": 0,
                 "failed_1h": 0,
+                "failed_1d": 0,
+                "bans_series": [],
+                "fails_series": [],
             }
 
-        stats = jails_data[jail_name][instance_name]
-
-        if "banned_current" in metric_name:
-            stats["banned_current"] = value
-        elif "banned_total" in metric_name:
-            stats["banned_total"] = value
-        elif "failed_current" in metric_name:
-            stats["failed_current"] = value
-        elif "failed_total" in metric_name:
-            stats["failed_total"] = value
-
-    # Helper function to process the 1h increase data
-    def merge_1h_data(data, stat_key):
+    # Helper to process increase() data (1h / 1d windows)
+    def merge_increase(data, stat_key):
         for result in data:
             metric = result.get("metric", {})
             jail_name = metric.get("jail")
@@ -173,23 +225,35 @@ def fetch_fail2ban_metrics():
                 raw_value = float(result.get("value", [0, 0.0])[1])
                 jails_data[jail_name][instance_name][stat_key] = int(round(raw_value))
 
-    # Merge the 1h data into our main dictionary
-    merge_1h_data(bans_1h_data, "banned_1h")
-    merge_1h_data(fails_1h_data, "failed_1h")
+    # Merge the windowed increase data into our main dictionary
+    merge_increase(bans_1h_data, "banned_1h")
+    merge_increase(fails_1h_data, "failed_1h")
+    merge_increase(bans_1d_data, "banned_1d")
+    merge_increase(fails_1d_data, "failed_1d")
+
+    # Helper to merge range ("values") data into a per-cell series
+    def merge_series(data, series_key):
+        for result in data:
+            metric = result.get("metric", {})
+            jail_name = metric.get("jail")
+            instance_name = metric.get("instance", "unknown")
+
+            if not jail_name or jail_name not in jails_data:
+                continue
+            if instance_name not in jails_data[jail_name]:
+                continue
+
+            series = [float(point[1]) for point in result.get("values", [])]
+            jails_data[jail_name][instance_name][series_key] = series
+
+    merge_series(bans_series_data, "bans_series")
+    merge_series(fails_series_data, "fails_series")
 
     return jails_data, sorted(list(instances))
 
 
-def format_metric_cur(value, gradient_max) -> str:
-    if value == 0:
-        return f"[bright_black]{value}[/bright_black]"
-
-    position = value / gradient_max if value > 0 else 0.0
-    color = get_gradient_color(position, VALUE_GRADIENT_STOPS)
-    return f"[bold {color}]{value}[/bold {color}]"
-
-
-def format_metric_last_h(value, gradient_max) -> str:
+def format_increase(value, gradient_max) -> str:
+    """Color-grades a windowed increase() value (1h / 1d)."""
     if value == 0:
         return f"[bright_black]{value}[/bright_black]"
 
@@ -201,36 +265,39 @@ def format_metric_last_h(value, gradient_max) -> str:
     return f"[bold {color}]{value}[/bold {color}]"
 
 
-def format_metric_total(value) -> str:
-    return str(value)
-
-
 def create_inner_grid(
-    bans_cur, bans_last_h, bans_total, fails_cur, fails_last_h, fails_total
+    bans_1h,
+    bans_1d,
+    fails_1h,
+    fails_1d,
+    bans_series=None,
+    fails_series=None,
 ):
     """Creates a borderless Rich Grid to perfectly align sub-columns."""
     grid = Table.grid(padding=(0, 0))
 
     # Define exact widths for each element in the string to enforce alignment
     grid.add_column(justify="left", width=7)  # Label ("Bans:" / "Fails:")
-    grid.add_column(justify="center", width=5)  # Current Value
-    grid.add_column(justify="center", width=3)  # Slash 1
-    grid.add_column(justify="center", width=5)  # 1h Value
-    grid.add_column(justify="center", width=3)  # Slash 2
-    grid.add_column(justify="center", width=5)  # Total Value
+    grid.add_column(justify="center", width=6)  # 1h Value
+    grid.add_column(justify="center", width=3)  # Slash
+    grid.add_column(justify="center", width=6)  # 1d Value
+    grid.add_column(
+        justify="left", width=SPARK_WIDTH + 1
+    )  # Inline sparkline (1h trend)
 
-    # Format colors
-    bans_cur_str = format_metric_cur(bans_cur, 30)
-    bans_last_h_str = format_metric_last_h(bans_last_h, 10)
-    bans_total_str = format_metric_total(bans_total)
+    # Format colors (gradient maxes tuned per window/metric)
+    bans_1h_str = format_increase(bans_1h, 10)
+    bans_1d_str = format_increase(bans_1d, 50)
+    fails_1h_str = format_increase(fails_1h, 100)
+    fails_1d_str = format_increase(fails_1d, 1000)
 
-    fails_cur_str = format_metric_cur(fails_cur, 10)
-    fails_last_h_str = format_metric_last_h(fails_last_h, 100)
-    fails_total_str = format_metric_total(fails_total)
+    # Leading space separates the sparkline from the 1d value column
+    bans_spark = " " + render_sparkline(bans_series or [])
+    fails_spark = " " + render_sparkline(fails_series or [])
 
     # Add the rows into our mini-grid
-    grid.add_row("Bans:", bans_cur_str, "/", bans_last_h_str, "/", bans_total_str)
-    grid.add_row("Fails:", fails_cur_str, "/", fails_last_h_str, "/", fails_total_str)
+    grid.add_row("Bans:", bans_1h_str, "/", bans_1d_str, bans_spark)
+    grid.add_row("Fails:", fails_1h_str, "/", fails_1d_str, fails_spark)
 
     return grid
 
@@ -238,7 +305,7 @@ def create_inner_grid(
 def display_matrix_table(jails_data, instances):
     """Renders the statistics in a Jail (Rows) x Nodes (Columns) matrix."""
     table = Table(
-        title="Fail2Ban Statistics Matrix (Current / 1h / Total)",
+        title="Fail2Ban Statistics Matrix (1h / 1d)",
         box=box.ROUNDED,
         header_style="bold cyan",
         title_style="bold bright_cyan",
@@ -264,12 +331,12 @@ def display_matrix_table(jails_data, instances):
             # Instead of manually padding strings, we pass the raw data
             # to our helper which returns a perfectly aligned Rich grid.
             cell_grid = create_inner_grid(
-                bans_cur=stats["banned_current"],
-                bans_last_h=stats["banned_1h"],
-                bans_total=stats["banned_total"],
-                fails_cur=stats["failed_current"],
-                fails_last_h=stats["failed_1h"],
-                fails_total=stats["failed_total"],
+                bans_1h=stats["banned_1h"],
+                bans_1d=stats["banned_1d"],
+                fails_1h=stats["failed_1h"],
+                fails_1d=stats["failed_1d"],
+                bans_series=stats["bans_series"],
+                fails_series=stats["fails_series"],
             )
 
             row.append(cell_grid)
